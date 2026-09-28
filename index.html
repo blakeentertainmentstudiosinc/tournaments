@@ -7,6 +7,10 @@
 <link href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 .entrant-details{display:flex;flex-direction:column;min-width:0;flex:1}.player-row .entrant-details .pname{flex:none}.deck-link{border:0;background:none;color:var(--brass);padding:1px 0 0;text-align:left;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}.deck-upload-card{padding:16px;border:1px solid #705135;background:#000000BB;border-radius:12px}.deck-upload-card input[type=file]{font-size:12px}.deck-preview{margin-top:12px}.deck-preview:empty{display:none}.deck-preview-ready,.deck-preview-error{padding:11px 12px;border:1px solid #775735;border-radius:9px;background:#D4A34D12;font-size:12px}.deck-preview-ready b{color:var(--brass)}.deck-preview-error{border-color:#8D4735;background:#A94F4018;color:#E8AAA0}.deck-summary{display:grid;gap:9px}.deck-overview{display:flex;justify-content:space-between;gap:12px;padding:12px;border:1px solid #946C42;background:#D4A34D14;border-radius:10px}.deck-overview span{color:var(--muted);font-size:12px}.deck-section{padding:11px 12px;border:1px solid var(--line);border-radius:9px;background:#ffffff04}.deck-section strong{display:flex;justify-content:space-between;font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:#F1E6CD}.deck-section small{color:var(--brass)}.deck-section ul{margin:8px 0 0;padding-left:18px;columns:2;color:#D7C8AD;font-size:12px}.deck-section li{break-inside:avoid;margin:2px 0}
+/* Guest CAPTCHA uses its own overlay so join and tournament forms stay intact. */
+.guest-verification{position:fixed;inset:0;z-index:100000;display:grid;place-items:center;padding:16px;background:rgba(0,0,0,.8)}
+.guest-verification-card{box-sizing:border-box;width:min(100%,390px);padding:22px;border:1px solid var(--brass);border-radius:12px;background:var(--panel,#17100b);color:var(--text,#f5ead4);box-shadow:0 20px 70px #000}
+.guest-verification-card h2{margin:0 0 10px;font-size:21px}.guest-verification-widget{margin:16px 0;min-height:1px}.guest-verification-card .btn{margin-top:8px}
 </style>
 <style>
 .login-screen,.discord-loading-screen{width:100%;max-width:520px;margin:0 auto;padding:34px;text-align:center;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,#1A120B,#100B07);box-shadow:var(--shadow)}.login-screen[hidden],.discord-loading-screen[hidden],.login-actions[hidden]{display:none!important}.topbar[hidden],.hero[hidden],.content[hidden]{display:none}body.login-mode .shell{width:100%;max-width:none;min-height:100vh;display:grid;place-items:center;padding:16px}body.login-mode .login-screen,body.login-mode .discord-loading-screen{margin:0 auto}.login-screen .welcome-mark{margin:0 auto 18px}.login-screen p,.discord-loading-screen p{color:var(--muted);margin:0 auto 22px;max-width:380px}.login-actions{display:grid;gap:9px}.login-actions .btn{width:100%}.discord-loading-indicator{width:34px;height:34px;margin:0 auto 18px;border:3px solid #684B2D;border-top-color:var(--brass);border-radius:50%;animation:discord-auth-spin .8s linear infinite}.discord-loading-screen h1{font-size:26px;margin:0 0 8px}@keyframes discord-auth-spin{to{transform:rotate(360deg)}}.top-actions{align-items:center}#authStatus{font-size:11px;max-width:260px;text-align:right}#discordSignOut{white-space:nowrap}
@@ -2344,7 +2348,10 @@ const SUPABASE_PUBLISHABLE_KEY='sb_publishable_syzclGnXIogaGUJD_FPyog_SDSCyY0b';
 const EMBED_HOST_ORIGIN='https://www.kingdomstcg.com';
 const EMBED_AUTH_RETURN=`${EMBED_HOST_ORIGIN}/tournaments`;
 const CLOUD_TABLE='kingdoms_tournament_brackets';
-const supabaseClient=window.supabase?.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY);
+// Keep the existing default storage key so previously saved sessions remain valid.
+const supabaseClient=window.supabase?.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY,{
+ auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true,storageKey:'sb-rvzxknkfcozoqbbcthjc-auth-token'}
+});
 async function redeemActivityTicket(){
   const ticket=new URLSearchParams(location.search).get('activity_ticket');
   if(!ticket||!supabaseClient)return false;
@@ -2402,7 +2409,58 @@ let signedInUser=null,cloudSaveTimer=null,cloudBusy=false,registrationRefresh=nu
 function isDiscordUser(){return Boolean(signedInUser&&!signedInUser.is_anonymous)}
 function discordDisplayName(u){return u?.user_metadata?.full_name||u?.user_metadata?.global_name||u?.user_metadata?.name||u?.user_metadata?.preferred_username||u?.user_metadata?.user_name||u?.email||'Discord player'}
 function discordHandle(u){const h=u?.user_metadata?.preferred_username||u?.user_metadata?.user_name||u?.user_metadata?.custom_claims?.global_name||'';return h&&h!==discordDisplayName(u)?h:''}
-async function ensureGuestSession(){if(signedInUser)return signedInUser;if(!supabaseClient)throw Error('Tournament sharing is unavailable because Supabase did not load');const {data,error}=await supabaseClient.auth.signInAnonymously();if(error)throw Error(`Could not create the guest session (${error.code||'auth error'}): ${error.message}. Check anonymous sign-in settings only if this is an auth error.`);signedInUser=data.user;return signedInUser}
+// Guest authentication: reuse sessions, serialize requests, and consume a fresh Turnstile token once.
+const TURNSTILE_SITE_KEY='0x4AAAAAAE5-5dVa_ljG800I';
+let guestSessionPromise=null,turnstileLoadPromise=null;
+function loadGuestTurnstile(){
+ if(window.turnstile)return Promise.resolve(window.turnstile);
+ if(turnstileLoadPromise)return turnstileLoadPromise;
+ turnstileLoadPromise=new Promise((resolve,reject)=>{
+  const script=document.createElement('script');script.src='https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';script.async=true;
+  const fail=()=>{clearTimeout(timer);script.remove();reject(Error('Verification could not load. Check your connection or content blocker, then try again.'))};
+  const timer=setTimeout(fail,20000);
+  script.onerror=fail;script.onload=()=>{clearTimeout(timer);if(window.turnstile)resolve(window.turnstile);else fail()};
+  document.head.appendChild(script);
+ }).catch(error=>{turnstileLoadPromise=null;throw error});
+ return turnstileLoadPromise;
+}
+async function guestCaptchaToken(){
+ const turnstile=await loadGuestTurnstile();
+ return new Promise((resolve,reject)=>{
+  const overlay=document.createElement('div');overlay.className='guest-verification';overlay.innerHTML='<section class="guest-verification-card" role="dialog" aria-modal="true" aria-labelledby="guestVerificationTitle"><h2 id="guestVerificationTitle">Verifying guest access</h2><p class="notice" role="status">Please wait. Complete the check below if prompted.</p><div class="guest-verification-widget"></div><button type="button" class="btn small">Cancel</button></section>';
+  const previousFocus=document.activeElement;let widgetId,finished=false;
+  const finish=(error,token)=>{if(finished)return;finished=true;clearTimeout(timer);if(widgetId!==undefined)try{turnstile.remove(widgetId)}catch{}overlay.remove();document.removeEventListener('keydown',onKey);previousFocus?.focus?.();error?reject(error):resolve(token)};
+  const cancel=()=>finish(Error('Guest verification cancelled.'));
+  const onKey=e=>{if(e.key==='Escape'){e.preventDefault();cancel()}else if(e.key==='Tab'&&e.target===overlay.querySelector('button')&&!e.shiftKey){e.preventDefault();overlay.querySelector('iframe')?.focus()}};
+  const timer=setTimeout(()=>finish(Error('Verification timed out. Please try again.')),120000);
+  overlay.querySelector('button').onclick=cancel;document.body.appendChild(overlay);document.addEventListener('keydown',onKey);overlay.querySelector('button').focus();
+  try{widgetId=turnstile.render(overlay.querySelector('.guest-verification-widget'),{
+   sitekey:TURNSTILE_SITE_KEY,theme:'dark',size:'flexible',appearance:'interaction-only',retry:'never',
+   callback:token=>token?finish(null,token):finish(Error('Verification returned no token. Please try again.')),
+   'error-callback':code=>{finish(Error(`Guest verification failed (${code}). Please try again. If it continues, check that this website is allowed in the Turnstile widget settings.`));return true},
+   'expired-callback':()=>finish(Error('Verification expired. Please try again.')),
+   'timeout-callback':()=>finish(Error('Verification timed out. Please try again.')),
+   'unsupported-callback':()=>finish(Error('This browser could not complete verification. Please try another browser.'))
+  });if(finished&&widgetId!==undefined)try{turnstile.remove(widgetId)}catch{}}catch(error){finish(error)}
+ });
+}
+async function ensureGuestSession(){
+ if(signedInUser)return signedInUser;
+ if(!supabaseClient)throw Error('Tournament sharing is unavailable because Supabase did not load');
+ if(guestSessionPromise)return guestSessionPromise;
+ guestSessionPromise=(async()=>{
+  const restored=await supabaseClient.auth.getSession();
+  if(restored.error)throw Error('Could not restore your guest session: '+restored.error.message);
+  if(restored.data?.session?.user){signedInUser=restored.data.session.user;return signedInUser}
+  const captchaToken=await guestCaptchaToken();
+  if(signedInUser)return signedInUser;
+  const {data,error}=await supabaseClient.auth.signInAnonymously({options:{captchaToken}});
+  if(error)throw Error(`Could not create the guest session (${error.code||'auth error'}): ${error.message}`);
+  if(!data?.user)throw Error('Guest sign-in returned no session. Please try again.');
+  signedInUser=data.user;return signedInUser;
+ })();
+ try{return await guestSessionPromise}finally{guestSessionPromise=null}
+}
 function userStorageKey(){return isDiscordUser()?`${KEY}:user:${signedInUser.id}`:KEY}
 function normalizeTournament(t){t.eventType=t.eventType||(t.seasonEligible?'ranked':'casual');t.organizerEvent=Boolean(t.organizerEvent||t.seasonEligible);t.pendingPlayerIds=t.pendingPlayerIds||[];t.playerIds=t.playerIds||{};t.registrationEnabled=Boolean(t.registrationEnabled||t.joinCode);return t}function readStoredTournaments(){try{const x=JSON.parse(localStorage.getItem(userStorageKey())||'[]');return Array.isArray(x)?x.map(normalizeTournament):[]}catch{return []}}
 function load(){tournaments=readStoredTournaments();if(tournaments.length)activeId=tournaments[0].id;render()}
@@ -2414,7 +2472,67 @@ async function openSeasonStandings(){if(!supabaseClient){toast('Season standings
 async function loadCloudTournaments(){if(!signedInUser||!supabaseClient)return;const {data,error}=await supabaseClient.from(CLOUD_TABLE).select('tournament_id,payload').order('updated_at',{ascending:false});if(error){console.warn('Tournament cloud load failed',error.message);toast('Cloud load failed. Local copy is still available.');return}const remote=(data||[]).map(r=>r.payload).filter(t=>t&&t.id).map(normalizeTournament);const local=readStoredTournaments();const byId=new Map(remote.map(t=>[t.id,t]));for(const t of local){const prior=byId.get(t.id);if(!prior||Date.parse(t.updatedAt||t.createdAt||0)>Date.parse(prior.updatedAt||prior.createdAt||0))byId.set(t.id,t)}tournaments=[...byId.values()];if(tournaments.length)activeId=tournaments[0].id;localStorage.setItem(userStorageKey(),JSON.stringify(tournaments));render();queueCloudSave();void refreshPlayerRegistrations()}
 function queueCloudSave(){if(!signedInUser||!supabaseClient)return;clearTimeout(cloudSaveTimer);cloudSaveTimer=setTimeout(async()=>{if(cloudBusy)return;cloudBusy=true;try{if(isDiscordUser()){const rows=tournaments.map(t=>({owner_id:signedInUser.id,tournament_id:String(t.id),name:t.name,format:t.format,location:t.location||'',published:true,registration_open:!t.rounds.length,payload:t,updated_at:new Date().toISOString()}));if(rows.length){const {error}=await supabaseClient.from(CLOUD_TABLE).upsert(rows,{onConflict:'owner_id,tournament_id'});if(error){console.warn('Tournament cloud save failed',error.message);toast('Cloud save failed. Export a backup before leaving this device.')}}}const listings=tournaments.filter(t=>t.registrationEnabled).map(t=>({owner_id:signedInUser.id,tournament_id:String(t.id),name:t.name,format:t.format,location:t.location||'',published:true,registration_open:!t.rounds.length,season_eligible:Boolean(t.seasonEligible),event_type:t.eventType||(t.seasonEligible?'ranked':'casual'),join_code:t.joinCode||null,event_date:t.eventDate||null,start_time:t.startTime||null,start_time_tentative:Boolean(t.startTimeTentative),updated_at:new Date().toISOString()}));if(listings.length){const {error:listingError}=await supabaseClient.from('kingdoms_tournament_listings').upsert(listings,{onConflict:'tournament_id'});if(listingError){console.warn('Tournament listing save failed',listingError);toast(`Supabase rejected the join-code listing (${listingError.code||'database error'}): ${listingError.message}. Guest users need an RLS policy for their anonymous account; this does not require public unauthenticated access.`)}}if(isDiscordUser()&&organizerApproved)for(const t of tournaments)if(t.registrationEnabled)await syncSeasonResults(t)}finally{cloudBusy=false}},350)}
 async function syncSeasonResults(t){if(!signedInUser||!organizerApproved||!t)return;const table=supabaseClient.from('kingdoms_tournament_season_results');if(!t.seasonEligible||!t.completed){const {error}=await table.delete().eq('tournament_id',String(t.id));if(error)console.warn('Season result cleanup failed',error.message);return}const rows=standings(t).filter(s=>t.playerIds?.[s.p]).map(s=>({owner_id:signedInUser.id,season_year:Number(t.seasonYear)||new Date().getFullYear(),tournament_id:String(t.id),player_id:t.playerIds[s.p],player_name:s.p,wins:s.w,draws:s.d,losses:s.l,season_points:s.pts,updated_at:new Date().toISOString()}));if(!rows.length){const {error}=await table.delete().eq('tournament_id',String(t.id));if(error)console.warn('Season result cleanup failed',error.message);return}const {error}=await table.upsert(rows,{onConflict:'season_year,tournament_id,player_id'});if(error){console.warn('Season result sync failed',error.message);toast('Tournament saved, but season results could not be synced.')}}
-async function initAuth(){resumePendingJoin();await redeemActivityTicket();const authError=new URLSearchParams(location.search).get('error_description')||new URLSearchParams(location.search).get('error');if(authError){history.replaceState(history.state,'',location.pathname+location.hash);resetDiscordSignIn();toast(`Discord sign-in did not finish: ${authError.replace(/\+/g,' ')}`)}$('#loginPageBack').onclick=hideLoginPage;$('#loginPageDiscord').onclick=startDiscordSignIn;$('#heroLoginBtn').onclick=openLoginEntry;$('#seasonBtn').onclick=openSeasonStandings;$('#organizerAccessBtn').onclick=openOrganizerAccess;window.addEventListener('popstate',()=>{if(signedInUser||bracketsRoute())hideLoginPage();else showLoginPage()});if(!supabaseClient){$('#authStatus').textContent='Supabase sign-in unavailable';if(bracketsRoute())hideLoginPage();else showLoginPage();return}$('#discordSignOut').onclick=async()=>{const {error}=await supabaseClient.auth.signOut();if(error){toast('Could not sign out');return}signedInUser=null;organizerApproved=false;organizerRequestStatus=null;load();setAuthUi();showLoginPage()};supabaseClient.auth.onAuthStateChange((_event,session)=>{const next=session?.user||null;if(next?.id===signedInUser?.id)return;signedInUser=next;if(next){discordSignInPending=false;clearTimeout(discordSignInResetTimer);discordSignInResetTimer=null;if(!next.is_anonymous)void loadOrganizerAccess();loadCloudTournaments();hideLoginPage();if(new URLSearchParams(location.search).has('join')&&(!joinFlowStarted||!next.is_anonymous)){joinFlowStarted=false;void openJoinRegistration()}}else{organizerApproved=false;organizerRequestStatus=null;load();setAuthUi();if(_event==='SIGNED_OUT')showLoginPage();else if(bracketsRoute()||new URLSearchParams(location.search).has('join')){hideLoginPage();if(new URLSearchParams(location.search).has('join'))void openJoinRegistration()}else showLoginPage()}});const {data,error}=await supabaseClient.auth.getSession();if(error)console.warn('Auth restore failed',error.message);signedInUser=data?.session?.user||null;setAuthUi();if(signedInUser){if(!signedInUser.is_anonymous)await loadOrganizerAccess();await loadCloudTournaments();hideLoginPage();if(new URLSearchParams(location.search).has('join')){joinFlowStarted=false;void openJoinRegistration()}}else if(new URLSearchParams(location.search).get('oauth')==='discord'){showOAuthLaunchScreen();void startDiscordSignIn()}else if(bracketsRoute()||new URLSearchParams(location.search).has('join')){hideLoginPage();if(new URLSearchParams(location.search).has('join'))void openJoinRegistration()}else showLoginPage()}
+// Restore authentication before choosing a screen; cloud reads never gate entering the app.
+// Supabase owns token persistence/rotation. No duplicate token cache is maintained.
+const ENTRY_PREFERENCE_KEY='kingdoms-tournament-entry-v1';
+let authInitialized=false,authUiUserKey=null,authRestorePromise=null;
+function rememberEntry(value){try{if(value)localStorage.setItem(ENTRY_PREFERENCE_KEY,value);else localStorage.removeItem(ENTRY_PREFERENCE_KEY)}catch{}}
+function rememberedGuest(){try{return localStorage.getItem(ENTRY_PREFERENCE_KEY)==='guest'}catch{return false}}
+function applyAuthSession(session,event='RESTORED'){
+ const next=session?.user||null;
+ const key=next?`${next.id}:${Boolean(next.is_anonymous)}`:null;
+ const changed=key!==authUiUserKey;
+ signedInUser=next;authUiUserKey=key;
+ if(next){
+  rememberEntry(next.is_anonymous?'guest':'discord');
+  discordSignInPending=false;clearTimeout(discordSignInResetTimer);discordSignInResetTimer=null;
+  if(changed){organizerApproved=false;organizerRequestStatus=null;load()}
+  setAuthUi();hideLoginPage();
+  if(changed){if(!next.is_anonymous)void loadOrganizerAccess().catch(error=>console.warn('Organizer restore failed',error.message));void loadCloudTournaments().catch(error=>console.warn('Cloud restore failed',error.message))}
+  if(new URLSearchParams(location.search).has('join')&&(changed||!joinFlowStarted)){joinFlowStarted=false;void openJoinRegistration()}
+  return;
+ }
+ organizerApproved=false;organizerRequestStatus=null;setAuthUi();
+ if(changed)load();
+ if(event==='SIGNED_OUT'){rememberEntry(null);showLoginPage();return}
+ if(new URLSearchParams(location.search).get('oauth')==='discord'){showOAuthLaunchScreen();void startDiscordSignIn();return}
+ if(bracketsRoute()||rememberedGuest()||new URLSearchParams(location.search).has('join')){hideLoginPage();if(new URLSearchParams(location.search).has('join'))void openJoinRegistration()}
+ else showLoginPage();
+}
+async function restoreAuthSession(){
+ if(!supabaseClient)return;
+ if(authRestorePromise)return authRestorePromise;
+ authRestorePromise=(async()=>{
+  const {data,error}=await supabaseClient.auth.getSession();
+  if(error){console.warn('Auth restore failed',error.message);toast('Could not restore your session yet. Check your connection and try again.');return false}
+  applyAuthSession(data?.session||null);return true;
+ })();
+ try{return await authRestorePromise}finally{authRestorePromise=null}
+}
+async function initAuth(){
+ resumePendingJoin();
+ $('#loginPageBack').onclick=()=>{rememberEntry('guest');hideLoginPage()};
+ $('#loginPageDiscord').onclick=startDiscordSignIn;$('#heroLoginBtn').onclick=openLoginEntry;$('#seasonBtn').onclick=openSeasonStandings;$('#organizerAccessBtn').onclick=openOrganizerAccess;
+ window.addEventListener('popstate',()=>{if(signedInUser||bracketsRoute()||rememberedGuest())hideLoginPage();else showLoginPage()});
+ if(!supabaseClient){$('#authStatus').textContent='Supabase sign-in unavailable';if(bracketsRoute()||rememberedGuest())hideLoginPage();else showLoginPage();return}
+ // Keep all further Supabase work outside its synchronous auth notification lock.
+ supabaseClient.auth.onAuthStateChange((event,session)=>{
+  if(!authInitialized||event==='INITIAL_SESSION')return;
+  setTimeout(()=>applyAuthSession(session,event),0);
+ });
+ $('#discordSignOut').onclick=async()=>{
+  const {error}=await supabaseClient.auth.signOut({scope:'local'});
+  if(error){toast('Could not sign out');return}
+  rememberEntry(null);applyAuthSession(null,'SIGNED_OUT');
+ };
+ await redeemActivityTicket();
+ const authError=new URLSearchParams(location.search).get('error_description')||new URLSearchParams(location.search).get('error');
+ if(authError){history.replaceState(history.state,'',location.pathname+location.hash);resetDiscordSignIn();toast(`Discord sign-in did not finish: ${authError.replace(/\+/g,' ')}`)}
+ try{await restoreAuthSession()}catch(error){console.warn('Session restore failed',error.message);toast('Session restore is temporarily unavailable. Please try again.')}finally{authInitialized=true}
+ // Recheck stored/refreshed credentials after reconnecting or restoring a closed/frozen tab.
+ const resume=()=>{if(authInitialized&&!document.hidden)void restoreAuthSession().catch(error=>console.warn('Session resume failed',error.message))};
+ window.addEventListener('online',resume);window.addEventListener('pageshow',resume);
+}
 let joinFlowStarted=false;
 // Sharing QR: bundled encoder, high error correction, four-module quiet zone.
 // Keep the castle backing below 20% of the symbol width to preserve scan reliability.
